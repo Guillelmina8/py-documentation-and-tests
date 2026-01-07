@@ -1,3 +1,7 @@
+import tempfile
+import os
+from PIL import Image
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework import status
@@ -23,7 +27,7 @@ def sample_movie(**params) -> Movie:
     return Movie.objects.create(**defaults)
 
 def image_upload_url(movie_id):
-    return reverse("cinema:movie-upload_image", args=[movie_id])
+    return reverse("cinema:movie-upload-image", args=[movie_id])
 
 
 class UnauthenticatedMovieViewSetTest(TestCase):
@@ -45,8 +49,8 @@ class AuthenticatedMovieViewSetTest(TestCase):
         self.client.force_authenticate(self.user)
 
     def test_movies_genres_list(self):
-        sample_movie()
-        movie_with_genre = sample_movie()
+        sample_movie(title="Movie 1")
+        movie_with_genre = sample_movie(title="Movie 2")
 
         genre_1 = Genre.objects.create(name="Comedy")
         genre_2 = Genre.objects.create(name="Fantasy")
@@ -57,11 +61,13 @@ class AuthenticatedMovieViewSetTest(TestCase):
         movies = Movie.objects.all()
         serializer = MovieListSerializer(movies, many=True)
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data, serializer.data)
+        sorted_res_data = sorted(res.data, key=lambda x: x["id"])
+        sorted_serializer_data = sorted(serializer.data, key=lambda x: x["id"])
+        self.assertEqual(sorted_res_data, sorted_serializer_data)
 
     def test_movies_actors_list(self):
-        sample_movie()
-        movie_with_actor = sample_movie()
+        sample_movie(title="Movie 1")
+        movie_with_actor = sample_movie(title="Movie 2")
 
         actor_1 = Actor.objects.create(first_name="Keanu", last_name="Reeves")
         actor_2 = Actor.objects.create(first_name="Jennifer", last_name="Lawrence")
@@ -72,7 +78,33 @@ class AuthenticatedMovieViewSetTest(TestCase):
         movies = Movie.objects.all()
         serializer = MovieListSerializer(movies, many=True)
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data, serializer.data)
+        sorted_res_data = sorted(res.data, key=lambda x: x["id"])
+        sorted_serializer_data = sorted(serializer.data, key=lambda x: x["id"])
+        self.assertEqual(sorted_res_data, sorted_serializer_data)
+
+    def test_filter_movies_by_title(self):
+        movie_with_title_1 = sample_movie(title="Funny Movie")
+        movie_with_title_2 = sample_movie(title="Interesting Movie")
+
+        res1 = self.client.get(
+            MOVIE_URL,
+            {"title": "funny"}
+        )
+        res2 = self.client.get(
+            MOVIE_URL,
+            {"title": "resting"}
+        )
+        res3 = self.client.get(
+            MOVIE_URL,
+            {"title": "Boring"}
+        )
+
+        serializer_movie_title_1 = MovieListSerializer(movie_with_title_1)
+        serializer_movie_title_2 = MovieListSerializer(movie_with_title_2)
+
+        self.assertIn(serializer_movie_title_1.data, res1.data)
+        self.assertIn(serializer_movie_title_2.data, res2.data)
+        self.assertNotIn(serializer_movie_title_2.data, res3.data)
 
     def test_filter_movies_by_genres(self):
         movie_without_genre = sample_movie()
@@ -90,13 +122,13 @@ class AuthenticatedMovieViewSetTest(TestCase):
             {"genres": f"{genre_1.id},{genre_2.id}"}
         )
 
-        serializer_without_genre = MovieListSerializer(movie_without_genre, many=True)
+        serializer_without_genre = MovieListSerializer(movie_without_genre)
         serializer_movie_genre_1 = MovieListSerializer(movie_with_genre_1)
         serializer_movie_genre_2 = MovieListSerializer(movie_with_genre_2)
 
         self.assertIn(serializer_movie_genre_1.data, res.data)
         self.assertIn(serializer_movie_genre_2.data, res.data)
-        self.assertNotIn(serializer_without_genre, res.data)
+        self.assertNotIn(serializer_without_genre.data, res.data)
 
     def test_filter_movies_by_actors(self):
         movie_without_actor = sample_movie()
@@ -120,7 +152,7 @@ class AuthenticatedMovieViewSetTest(TestCase):
 
         self.assertIn(serializer_movie_actor_1.data, res.data)
         self.assertIn(serializer_movie_actor_2.data, res.data)
-        self.assertNotIn(serializer_without_actor, res.data)
+        self.assertNotIn(serializer_without_actor.data, res.data)
 
     def test_retrieve_movie_details(self):
         movie = sample_movie()
@@ -143,6 +175,15 @@ class AuthenticatedMovieViewSetTest(TestCase):
         }
 
         res = self.client.post(MOVIE_URL, payload)
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_upload_image_forbidden(self):
+        movie = sample_movie()
+        url = image_upload_url(movie.id)
+        payload = {"image": "temp_image.jpg"}
+
+        res = self.client.post(url, payload, format="multipart")
 
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
@@ -192,3 +233,42 @@ class AdminMovieTests(TestCase):
         self.assertIn(genre_1, genres)
         self.assertIn(genre_2, genres)
         self.assertEqual(genres.count(), 2)
+
+    def test_create_movie_with_actors(self):
+        actor_1 = Actor.objects.create(first_name="Keanu", last_name="Reeves")
+        actor_2 = Actor.objects.create(first_name="Jennifer", last_name="Lawrence")
+        payload = {
+            "title": "Movie Title",
+            "description": "Movie Description",
+            "duration": 105,
+            "actors": [actor_1.id, actor_2.id],
+        }
+
+        res = self.client.post(MOVIE_URL, payload)
+
+        movie = Movie.objects.get(id=res.data["id"])
+        actors = movie.actors.all()
+
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertIn(actor_1, actors)
+        self.assertIn(actor_2, actors)
+        self.assertEqual(actors.count(), 2)
+
+    def test_upload_image_success(self):
+        movie = sample_movie()
+        url = image_upload_url(movie.id)
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as ntf:
+            img = Image.new("RGB", (10, 10))
+            img.save(ntf, format="JPEG")
+            ntf.seek(0)
+
+            res = self.client.post(url, {"image": ntf}, format="multipart")
+
+        movie.refresh_from_db()
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("image", res.data)
+        self.assertTrue(os.path.exists(movie.image.path))
+
+        if movie.image:
+            os.remove(movie.image.path)
